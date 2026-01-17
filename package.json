@@ -1,0 +1,63 @@
+{
+  "name": "@eternalheart/mcp-dependency-doctor",
+  "version": "1.0.0",
+  "description": "MCP server for diagnosing and fixing Node.js dependency conflicts",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "mcp-dependency-doctor": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts"
+  },
+  "keywords": [
+    "mcp",
+    "dependency",
+    "npm",
+    "pnpm",
+    "yarn",
+    "monorepo",
+    "conflict",
+    "analyzer"
+  ],
+  "author": {
+    "email": "hao131462@qq.com",
+    "name": "EternalHeart",
+    "url": "https://github.com/wh131462"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wh131462/mcp-dependency-doctor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wh131462/mcp-dependency-doctor/issues"
+  },
+  "homepage": "https://github.com/wh131462/mcp-dependency-doctor#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "execa": "^9.5.0",
+    "glob": "^11.0.0",
+    "semver": "^7.6.0",
+    "yaml": "^2.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/semver": "^7.5.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist"
+  ]
+}
