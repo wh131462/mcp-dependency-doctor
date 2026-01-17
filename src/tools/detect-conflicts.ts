@@ -31,6 +31,7 @@ const conflictTypes = [
   "engine_mismatch",
   "deprecated",
   "missing_dependency",
+  "circular_dependency",
 ] as const;
 
 // 输入参数 Schema
@@ -143,6 +144,11 @@ async function detectConflicts(
   if (checkTypes.includes("engine_mismatch")) {
     const engineIssues = detectEngineMismatch(packageJson);
     issues.push(...engineIssues);
+  }
+
+  if (checkTypes.includes("circular_dependency")) {
+    const circularIssues = await detectCircularDependencies(projectPath, pmInfo.name);
+    issues.push(...circularIssues);
   }
 
   // 过滤严重级别
@@ -489,6 +495,318 @@ function detectEngineMismatch(packageJson: PackageJson): ConflictIssue[] {
 }
 
 /**
+ * 检测循环依赖
+ */
+async function detectCircularDependencies(
+  projectPath: string,
+  _pm: string
+): Promise<ConflictIssue[]> {
+  const issues: ConflictIssue[] = [];
+
+  // 1. 检测 node_modules 中的循环依赖
+  const nodeModulesPath = path.join(projectPath, "node_modules");
+  const nodeModulesCycles = await detectNodeModulesCycles(nodeModulesPath);
+  for (const cycle of nodeModulesCycles) {
+    issues.push({
+      id: generateId(),
+      type: "circular_dependency",
+      severity: "warning",
+      package: cycle[0],
+      message: `检测到 node_modules 循环依赖: ${cycle.join(" → ")} → ${cycle[0]}`,
+      details: {
+        circularDependency: {
+          cycle,
+          type: "node_modules",
+        },
+      },
+      affectedPaths: cycle,
+      suggestedAction: generateNodeModulesCycleSuggestion(cycle),
+    });
+  }
+
+  // 2. 检测项目源码中的循环依赖
+  const srcPath = path.join(projectPath, "src");
+  const sourceCodeCycles = await detectSourceCodeCycles(srcPath);
+  for (const cycle of sourceCodeCycles) {
+    const relativeCycle = cycle.map((p) => path.relative(projectPath, p));
+    issues.push({
+      id: generateId(),
+      type: "circular_dependency",
+      severity: "error",
+      package: path.basename(cycle[0]),
+      message: `检测到源码循环依赖: ${relativeCycle.join(" → ")}`,
+      details: {
+        circularDependency: {
+          cycle: relativeCycle,
+          type: "source_code",
+        },
+      },
+      affectedPaths: relativeCycle,
+      suggestedAction: generateSourceCodeCycleSuggestion(relativeCycle),
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * 检测 node_modules 中的循环依赖
+ */
+async function detectNodeModulesCycles(nodeModulesPath: string): Promise<string[][]> {
+  const cycles: string[][] = [];
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+  const graph = new Map<string, string[]>();
+
+  // 构建依赖图
+  try {
+    const { glob } = await import("glob");
+    const packageJsonFiles = await glob("*/package.json", {
+      cwd: nodeModulesPath,
+      ignore: ["@*/**"],
+    });
+
+    // 包括 scoped packages
+    const scopedPackageJsonFiles = await glob("@*/*/package.json", {
+      cwd: nodeModulesPath,
+    });
+
+    const allPackageJsonFiles = [...packageJsonFiles, ...scopedPackageJsonFiles];
+
+    for (const pkgJsonPath of allPackageJsonFiles) {
+      const fullPath = path.join(nodeModulesPath, pkgJsonPath);
+      const pkgJson = await readJsonFile<PackageJson>(fullPath);
+      if (pkgJson) {
+        const pkgName = pkgJson.name || path.dirname(pkgJsonPath);
+        const deps = Object.keys(pkgJson.dependencies || {});
+        graph.set(pkgName, deps);
+      }
+    }
+  } catch {
+    // node_modules 可能不存在
+    return cycles;
+  }
+
+  // DFS 检测循环
+  function dfs(node: string, path: string[]): void {
+    if (recursionStack.has(node)) {
+      // 找到循环
+      const cycleStart = path.indexOf(node);
+      if (cycleStart !== -1) {
+        const cycle = path.slice(cycleStart);
+        // 只保留长度 <= 5 的循环，避免输出过多
+        if (cycle.length <= 5 && cycle.length >= 2) {
+          cycles.push(cycle);
+        }
+      }
+      return;
+    }
+
+    if (visited.has(node)) {
+      return;
+    }
+
+    visited.add(node);
+    recursionStack.add(node);
+    path.push(node);
+
+    const deps = graph.get(node) || [];
+    for (const dep of deps) {
+      if (graph.has(dep)) {
+        dfs(dep, [...path]);
+      }
+    }
+
+    recursionStack.delete(node);
+  }
+
+  for (const node of graph.keys()) {
+    if (!visited.has(node)) {
+      dfs(node, []);
+    }
+  }
+
+  // 去重
+  const uniqueCycles = new Map<string, string[]>();
+  for (const cycle of cycles) {
+    const key = [...cycle].sort().join(",");
+    if (!uniqueCycles.has(key)) {
+      uniqueCycles.set(key, cycle);
+    }
+  }
+
+  return Array.from(uniqueCycles.values()).slice(0, 10); // 最多返回 10 个
+}
+
+/**
+ * 检测项目源码中的循环依赖
+ */
+async function detectSourceCodeCycles(srcPath: string): Promise<string[][]> {
+  const cycles: string[][] = [];
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+  const graph = new Map<string, string[]>();
+
+  // 构建导入图
+  try {
+    const { glob } = await import("glob");
+    const sourceFiles = await glob("**/*.{ts,tsx,js,jsx,mjs,cjs}", {
+      cwd: srcPath,
+      ignore: ["node_modules/**", "dist/**", "build/**", "*.d.ts"],
+    });
+
+    const importRegex = /(?:import|require)\s*\(?['"](\.\.?\/[^'"]+)['"]\)?/g;
+    const fs = await import("node:fs/promises");
+
+    for (const file of sourceFiles) {
+      const fullPath = path.join(srcPath, file);
+      try {
+        const content = await fs.readFile(fullPath, "utf-8");
+        const imports: string[] = [];
+
+        let match;
+        while ((match = importRegex.exec(content)) !== null) {
+          const importPath = match[1];
+          // 解析相对路径
+          let resolved = path.resolve(path.dirname(fullPath), importPath);
+
+          // 尝试添加扩展名
+          const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.js"];
+          for (const ext of extensions) {
+            try {
+              await fs.access(resolved + ext);
+              resolved = resolved + ext;
+              break;
+            } catch {
+              // 继续尝试
+            }
+          }
+
+          imports.push(resolved);
+        }
+
+        graph.set(fullPath, imports);
+      } catch {
+        // 文件读取失败
+      }
+    }
+  } catch {
+    return cycles;
+  }
+
+  // DFS 检测循环
+  function dfs(node: string, path: string[]): void {
+    if (recursionStack.has(node)) {
+      const cycleStart = path.indexOf(node);
+      if (cycleStart !== -1) {
+        const cycle = path.slice(cycleStart);
+        if (cycle.length >= 2) {
+          cycles.push(cycle);
+        }
+      }
+      return;
+    }
+
+    if (visited.has(node)) {
+      return;
+    }
+
+    visited.add(node);
+    recursionStack.add(node);
+    path.push(node);
+
+    const deps = graph.get(node) || [];
+    for (const dep of deps) {
+      if (graph.has(dep)) {
+        dfs(dep, [...path]);
+      }
+    }
+
+    recursionStack.delete(node);
+  }
+
+  for (const node of graph.keys()) {
+    if (!visited.has(node)) {
+      dfs(node, []);
+    }
+  }
+
+  // 去重
+  const uniqueCycles = new Map<string, string[]>();
+  for (const cycle of cycles) {
+    const key = [...cycle].sort().join(",");
+    if (!uniqueCycles.has(key)) {
+      uniqueCycles.set(key, cycle);
+    }
+  }
+
+  return Array.from(uniqueCycles.values()).slice(0, 10);
+}
+
+/**
+ * 生成 node_modules 循环依赖的修复建议
+ */
+function generateNodeModulesCycleSuggestion(cycle: string[]): string {
+  const suggestions: string[] = [];
+
+  if (cycle.length === 2) {
+    // 简单的双向依赖
+    suggestions.push(
+      `包 ${cycle[0]} 和 ${cycle[1]} 存在相互依赖。`,
+      "解决方案：",
+      `1. 检查是否可以升级 ${cycle[0]} 或 ${cycle[1]} 到更新版本`,
+      "2. 查看包的 GitHub issues 是否有相关讨论",
+      "3. 如果不影响运行，可以暂时忽略（Node.js 可处理简单循环）"
+    );
+  } else {
+    // 多包循环链
+    suggestions.push(
+      `检测到 ${cycle.length} 个包形成循环依赖链。`,
+      "解决方案：",
+      "1. 尝试升级循环链中的某个包来打破循环",
+      `2. 使用 \`npm why ${cycle[0]}\` 查看为什么需要这个包`,
+      "3. 考虑使用替代包",
+      "4. 如果是开发依赖且不影响构建，可以暂时忽略"
+    );
+  }
+
+  return suggestions.join("\n");
+}
+
+/**
+ * 生成源码循环依赖的修复建议
+ */
+function generateSourceCodeCycleSuggestion(cycle: string[]): string {
+  const suggestions: string[] = [];
+  const fileNames = cycle.map((p) => path.basename(p));
+
+  suggestions.push(
+    `文件 ${fileNames.join(" 和 ")} 之间存在循环导入。`,
+    "",
+    "**修复方案：**",
+    "",
+    "**方案1: 提取公共模块**",
+    `  将 ${fileNames[0]} 和 ${fileNames[1]} 共用的代码提取到新文件`,
+    "",
+    "**方案2: 延迟导入**",
+    "  在函数内部使用动态导入：",
+    "  ```typescript",
+    "  async function example() {",
+    `    const module = await import('./${fileNames[1].replace(/\.[^.]+$/, '')}');`,
+    "  }",
+    "  ```",
+    "",
+    "**方案3: 依赖注入**",
+    "  不直接导入，而是通过参数传递依赖",
+    "",
+    "**方案4: 合并模块**",
+    "  如果两个文件逻辑紧密相关，考虑合并为一个文件"
+  );
+
+  return suggestions.join("\n");
+}
+
+/**
  * 格式化冲突报告
  */
 function formatConflictsReport(output: DetectConflictsOutput): string {
@@ -600,6 +918,7 @@ function formatConflictType(type: ConflictType): string {
     engine_mismatch: "Engine 不匹配",
     deprecated: "已废弃包",
     missing_dependency: "缺失依赖",
+    circular_dependency: "循环依赖",
   };
   return names[type] || type;
 }

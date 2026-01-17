@@ -145,6 +145,10 @@ async function applyFix(input: ApplyFixInput): Promise<FixResult> {
     }
   }
 
+  // 收集需要执行的安装/升级命令
+  const installCommands: Array<{ pkg: string; version: string; isDev: boolean }> = [];
+  const upgradeCommands: Array<{ pkg: string; version: string; isDev: boolean }> = [];
+
   // 应用修复
   for (const fix of fixList) {
     const { package: pkgName, version, type } = fix;
@@ -164,6 +168,82 @@ async function applyFix(input: ApplyFixInput): Promise<FixResult> {
         action: "override",
         to: version,
       });
+    } else if (type === "install") {
+      // 安装缺失的 peer dependency
+      const isDev = isDevDependency(packageJson, pkgName);
+      installCommands.push({ pkg: pkgName, version, isDev });
+
+      result.appliedFixes.push({
+        package: pkgName,
+        action: "install",
+        to: version,
+      });
+    } else if (type === "upgrade") {
+      // 升级/降级包到兼容版本
+      const isDev = isDevDependency(packageJson, pkgName);
+      const currentVersion = getCurrentVersion(packageJson, pkgName);
+      upgradeCommands.push({ pkg: pkgName, version, isDev });
+
+      result.appliedFixes.push({
+        package: pkgName,
+        action: "upgrade",
+        from: currentVersion,
+        to: version,
+      });
+    }
+  }
+
+  // 执行安装命令
+  if (installCommands.length > 0) {
+    const { prodPkgs, devPkgs } = groupByDevDep(installCommands);
+
+    if (prodPkgs.length > 0) {
+      const cmd = buildInstallCommand(pmInfo.name, prodPkgs, false);
+      result.commands.push(cmd);
+      if (!dryRun) {
+        const installResult = await execCommand(cmd, projectPath);
+        if (installResult.exitCode !== 0) {
+          result.warnings.push(`安装命令失败: ${installResult.stderr}`);
+        }
+      }
+    }
+
+    if (devPkgs.length > 0) {
+      const cmd = buildInstallCommand(pmInfo.name, devPkgs, true);
+      result.commands.push(cmd);
+      if (!dryRun) {
+        const installResult = await execCommand(cmd, projectPath);
+        if (installResult.exitCode !== 0) {
+          result.warnings.push(`安装 devDependencies 失败: ${installResult.stderr}`);
+        }
+      }
+    }
+  }
+
+  // 执行升级命令
+  if (upgradeCommands.length > 0) {
+    const { prodPkgs, devPkgs } = groupByDevDep(upgradeCommands);
+
+    if (prodPkgs.length > 0) {
+      const cmd = buildInstallCommand(pmInfo.name, prodPkgs, false);
+      result.commands.push(cmd);
+      if (!dryRun) {
+        const upgradeResult = await execCommand(cmd, projectPath);
+        if (upgradeResult.exitCode !== 0) {
+          result.warnings.push(`升级命令失败: ${upgradeResult.stderr}`);
+        }
+      }
+    }
+
+    if (devPkgs.length > 0) {
+      const cmd = buildInstallCommand(pmInfo.name, devPkgs, true);
+      result.commands.push(cmd);
+      if (!dryRun) {
+        const upgradeResult = await execCommand(cmd, projectPath);
+        if (upgradeResult.exitCode !== 0) {
+          result.warnings.push(`升级 devDependencies 失败: ${upgradeResult.stderr}`);
+        }
+      }
     }
   }
 
@@ -200,9 +280,13 @@ async function applyFix(input: ApplyFixInput): Promise<FixResult> {
 async function detectPeerDependencyIssues(
   projectPath: string,
   pm: string
-): Promise<Array<{ package: string; version: string; type: "override" }>> {
-  const fixes: Array<{ package: string; version: string; type: "override" }> = [];
+): Promise<Array<{ package: string; version: string; type: "override" | "install" | "upgrade" }>> {
+  const fixes: Array<{ package: string; version: string; type: "override" | "install" | "upgrade" }> = [];
   const registryClient = new RegistryClient();
+
+  // 读取 package.json 检查已安装的依赖
+  const packageJsonPath = path.join(projectPath, "package.json");
+  const packageJson = await readJsonFile<PackageJson>(packageJsonPath);
 
   // 运行安装命令获取警告
   let command: string;
@@ -224,11 +308,14 @@ async function detectPeerDependencyIssues(
   const output = result.stdout + result.stderr;
 
   // 解析 pnpm 的 peer dependency 警告
-  // 格式: ✕ unmet peer less@^4: found 3.13.1
-  const pnpmPeerRegex = /✕ unmet peer (.+?)@(.+?): found (.+)/g;
+  // 格式1: ✕ unmet peer less@^4: found 3.13.1 (版本不匹配)
+  // 格式2: ✕ missing peer react@>=16 (缺失)
+  const pnpmUnmetRegex = /✕ unmet peer (.+?)@(.+?): found (.+)/g;
+  const pnpmMissingRegex = /✕ missing peer (.+?)@(.+?)(?:\s|$)/g;
   let match;
 
-  while ((match = pnpmPeerRegex.exec(output)) !== null) {
+  // 处理版本不匹配的情况
+  while ((match = pnpmUnmetRegex.exec(output)) !== null) {
     const [, pkgName, required, found] = match;
 
     // 检查是否已经添加过
@@ -239,10 +326,8 @@ async function detectPeerDependencyIssues(
     // 确定目标版本
     let targetVersion: string;
 
-    // 如果需要的版本比已安装的低，使用已安装的版本（因为某些包可能向后兼容）
-    // 如果需要的版本比已安装的高，查询 registry 获取满足要求的版本
+    // 查询 registry 获取满足要求的版本
     if (required.startsWith("^") || required.startsWith("~") || required.startsWith(">=")) {
-      // 查询 registry 获取最新满足要求的版本
       const pkgInfo = await registryClient.getPackageInfo(pkgName);
       if (pkgInfo) {
         const semver = await import("semver");
@@ -251,30 +336,67 @@ async function detectPeerDependencyIssues(
         if (satisfying) {
           targetVersion = satisfying;
         } else {
-          // 如果没有满足的版本，使用最新版本
           targetVersion = pkgInfo["dist-tags"].latest;
         }
       } else {
-        // 无法获取 registry 信息，尝试提取版本号
         const versionMatch = required.match(/[\d.]+/);
         targetVersion = versionMatch ? versionMatch[0] : found;
       }
     } else {
-      // 精确版本
       targetVersion = required;
     }
+
+    // 判断修复类型：如果包已安装在 dependencies 中，使用 upgrade；否则使用 override
+    const isDirectDep = packageJson && (
+      packageJson.dependencies?.[pkgName] ||
+      packageJson.devDependencies?.[pkgName]
+    );
 
     fixes.push({
       package: pkgName,
       version: targetVersion,
-      type: "override",
+      type: isDirectDep ? "upgrade" : "override",
+    });
+  }
+
+  // 处理缺失的情况
+  while ((match = pnpmMissingRegex.exec(output)) !== null) {
+    const [, pkgName, required] = match;
+
+    if (fixes.some((f) => f.package === pkgName)) {
+      continue;
+    }
+
+    // 查询 registry 获取满足要求的版本
+    let targetVersion: string;
+    const pkgInfo = await registryClient.getPackageInfo(pkgName);
+
+    if (pkgInfo) {
+      const semver = await import("semver");
+      const allVersions = Object.keys(pkgInfo.versions);
+      const satisfying = semver.maxSatisfying(allVersions, required);
+      targetVersion = satisfying || pkgInfo["dist-tags"].latest;
+    } else {
+      const versionMatch = required.match(/[\d.]+/);
+      targetVersion = versionMatch ? versionMatch[0] : "latest";
+    }
+
+    // 缺失的 peer dependency 使用 install
+    fixes.push({
+      package: pkgName,
+      version: targetVersion,
+      type: "install",
     });
   }
 
   // 解析 npm 的 peer dependency 警告
-  // 格式: npm warn peer dep missing: react@>=16, required by some-package
-  const npmPeerRegex = /peer dep missing: (.+?)@(.+?),/g;
-  while ((match = npmPeerRegex.exec(output)) !== null) {
+  // 格式1: npm warn peer dep missing: react@>=16, required by some-package (缺失)
+  // 格式2: npm warn peer dep conflict: react@17 required by X, but react@18 installed (冲突)
+  const npmMissingRegex = /peer dep(?:endency)? missing: (.+?)@(.+?),/g;
+  const npmConflictRegex = /peer dep(?:endency)? (.+?)@(.+?) required .+ (.+?)@(.+?) (?:installed|was installed)/gi;
+
+  // 处理缺失的 peer dependency
+  while ((match = npmMissingRegex.exec(output)) !== null) {
     const [, pkgName, required] = match;
 
     if (fixes.some((f) => f.package === pkgName)) {
@@ -294,14 +416,105 @@ async function detectPeerDependencyIssues(
       }
     }
 
+    // 缺失的使用 install
     fixes.push({
       package: pkgName,
       version: targetVersion,
-      type: "override",
+      type: "install",
+    });
+  }
+
+  // 处理冲突的 peer dependency
+  while ((match = npmConflictRegex.exec(output)) !== null) {
+    const [, pkgName, required] = match;
+
+    if (fixes.some((f) => f.package === pkgName)) {
+      continue;
+    }
+
+    const pkgInfo = await registryClient.getPackageInfo(pkgName);
+    let targetVersion = required.replace(/[<>=^~]/g, "");
+
+    if (pkgInfo) {
+      const semver = await import("semver");
+      const allVersions = Object.keys(pkgInfo.versions);
+      const satisfying = semver.maxSatisfying(allVersions, required);
+      if (satisfying) {
+        targetVersion = satisfying;
+      }
+    }
+
+    // 判断修复类型
+    const isDirectDep = packageJson && (
+      packageJson.dependencies?.[pkgName] ||
+      packageJson.devDependencies?.[pkgName]
+    );
+
+    fixes.push({
+      package: pkgName,
+      version: targetVersion,
+      type: isDirectDep ? "upgrade" : "override",
     });
   }
 
   return fixes;
+}
+
+/**
+ * 检查包是否是 devDependency
+ */
+function isDevDependency(packageJson: PackageJson, pkgName: string): boolean {
+  return !!(packageJson.devDependencies && packageJson.devDependencies[pkgName]);
+}
+
+/**
+ * 获取当前安装的版本
+ */
+function getCurrentVersion(packageJson: PackageJson, pkgName: string): string | undefined {
+  return (
+    packageJson.dependencies?.[pkgName] ||
+    packageJson.devDependencies?.[pkgName] ||
+    packageJson.peerDependencies?.[pkgName]
+  );
+}
+
+/**
+ * 按 dev/prod 分组
+ */
+function groupByDevDep(
+  pkgs: Array<{ pkg: string; version: string; isDev: boolean }>
+): { prodPkgs: string[]; devPkgs: string[] } {
+  const prodPkgs: string[] = [];
+  const devPkgs: string[] = [];
+
+  for (const { pkg, version, isDev } of pkgs) {
+    const pkgSpec = `${pkg}@${version}`;
+    if (isDev) {
+      devPkgs.push(pkgSpec);
+    } else {
+      prodPkgs.push(pkgSpec);
+    }
+  }
+
+  return { prodPkgs, devPkgs };
+}
+
+/**
+ * 构建安装命令
+ */
+function buildInstallCommand(pm: string, packages: string[], isDev: boolean): string {
+  const pkgList = packages.join(" ");
+
+  switch (pm) {
+    case "npm":
+      return isDev ? `npm install -D ${pkgList}` : `npm install ${pkgList}`;
+    case "pnpm":
+      return isDev ? `pnpm add -D ${pkgList}` : `pnpm add ${pkgList}`;
+    case "yarn":
+      return isDev ? `yarn add -D ${pkgList}` : `yarn add ${pkgList}`;
+    default:
+      return `npm install ${isDev ? "-D " : ""}${pkgList}`;
+  }
 }
 
 /**

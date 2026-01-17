@@ -7,17 +7,18 @@
 - **环境检测** - 自动识别包管理器 (npm/pnpm/yarn)、monorepo 结构、workspace 配置
 - **依赖分析** - 解析 package.json 和 lock 文件，构建完整依赖树
 - **冲突检测** - 检测版本冲突、peerDependencies 问题、多版本依赖等
+- **循环依赖检测** - 检测 node_modules 和项目源码中的循环依赖，并提供详细修复建议
 - **依赖追踪** - 追踪特定依赖的完整路径和来源
 - **Registry 查询** - 查询 npm registry 获取真实版本信息
 - **解决方案生成** - 为检测到的问题生成多个解决方案并进行比较
-- **自动修复** - 通过添加 overrides/resolutions 自动修复 peer dependency 警告
+- **自动修复** - 智能修复依赖问题，支持 override、install、upgrade 三种修复方式
 
 ## 安装
 
 ### 方式一：使用 Claude Code CLI（推荐）
 
 ```bash
-claude mcp add @eternalheart/mcp-dependency-doctor
+claude mcp add dependency-doctor -- npx @eternalheart/mcp-dependency-doctor
 ```
 
 ### 方式二：全局安装
@@ -104,8 +105,24 @@ npm run build
   - workspace_mismatch: workspace 版本不一致
   - override_risk: overrides/resolutions 风险
   - engine_mismatch: engine 不匹配
+  - circular_dependency: 循环依赖 (node_modules + 源码)
 - severity: 过滤严重级别 (all/error/warning)
 ```
+
+**循环依赖检测说明:**
+
+检测到循环依赖时，会提供详细的修复建议：
+
+| 类型 | 严重级别 | 说明 |
+|------|---------|------|
+| node_modules 循环 | warning | 第三方包之间的循环依赖，通常可忽略 |
+| 源码循环 | error | 项目内部 import/require 循环，需要修复 |
+
+**源码循环依赖修复方案:**
+1. **提取公共模块** - 将共用代码提取到新文件
+2. **延迟导入** - 使用 `await import()` 动态导入
+3. **依赖注入** - 通过参数传递依赖
+4. **合并模块** - 逻辑紧密相关时考虑合并
 
 #### 4. `trace_dependency`
 
@@ -148,7 +165,7 @@ npm run build
 
 #### 7. `apply_fix`
 
-**自动修复依赖冲突**。通过添加 overrides/resolutions 解决 peer dependency 警告。
+**智能修复依赖问题**。支持三种修复方式，自动检测问题类型并选择最佳修复策略。
 
 ```
 参数:
@@ -162,6 +179,19 @@ npm run build
 - reinstall: 修改后是否重新安装依赖 (可选，默认 true)
 ```
 
+**修复类型说明:**
+
+| 类型 | 场景 | 动作 |
+|------|------|------|
+| `override` | 间接依赖版本不匹配 | 添加 overrides/resolutions 强制锁定版本 |
+| `install` | 缺失的 peer dependency | 执行 npm/pnpm/yarn add 安装包 |
+| `upgrade` | 直接依赖版本不匹配 | 升级/降级包到兼容版本 |
+
+**自动检测逻辑:**
+- 缺失的 peer dependency → `install`
+- 直接依赖版本不匹配 → `upgrade`
+- 间接依赖版本不匹配 → `override`
+
 **示例 - 自动修复所有 peer dependency 警告:**
 ```
 apply_fix({ projectPath: "/path/to/project" })
@@ -172,8 +202,8 @@ apply_fix({ projectPath: "/path/to/project" })
 apply_fix({
   projectPath: "/path/to/project",
   fixes: [
-    { package: "less", version: "^4.2.0" },
-    { package: "rollup", version: "^3.29.4" }
+    { package: "less", version: "^4.2.0", type: "upgrade" },
+    { package: "rollup", version: "^3.29.4", type: "override" }
   ]
 })
 ```

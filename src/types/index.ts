@@ -103,7 +103,8 @@ export type ConflictType =
   | "override_risk"
   | "engine_mismatch"
   | "deprecated"
-  | "missing_dependency";
+  | "missing_dependency"
+  | "circular_dependency";
 
 export type Severity = "error" | "warning" | "info";
 
@@ -154,6 +155,10 @@ export interface ConflictDetails {
     required: string;
     current: string;
     field: "node" | "npm" | "pnpm" | "yarn";
+  };
+  circularDependency?: {
+    cycle: string[];
+    type: "node_modules" | "source_code";
   };
 }
 
