@@ -9,11 +9,14 @@
     "mcp-dependency-doctor": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean",
+    "build": "tsup",
     "dev": "tsx watch src/index.ts",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts"
+    "typecheck": "tsup --dts-only",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build",
+    "publish:npm": "npm publish --registry https://registry.npmjs.com --access public"
   },
   "keywords": [
     "mcp",
@@ -50,8 +53,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/semver": "^7.5.0",
-    "tsup": "^8.3.0",
-    "tsx": "^4.19.0",
+    "tsup": "^8.0.0",
     "typescript": "^5.7.0"
   },
   "engines": {
